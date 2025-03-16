@@ -1,0 +1,165 @@
+---
+title: "LDWF LIne Selection Process"
+author: "Tori Drake"
+date: "2024-04-14"
+output: html_document
+---
+
+### Set up Document
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(readr)
+set.seed(1) # Ensure reproducibility
+```
+
+### Load Data
+
+```{r}
+
+data <- read_csv("02_01_2024_Final_Lines.csv")
+```
+
+### First Strata (Random 10%) Selection w/o Back-to-back selection
+
+```{r}
+total_transects <- nrow(data)
+sample_size <- 80  # Ensuring minimum 80 selected
+
+select_non_adjacent <- function(data, sample_size) {
+  selected <- data %>%
+    slice_sample(n = sample_size, replace = FALSE) %>%
+    arrange(OBJECTID)
+  
+  while (TRUE) {
+    # Remove back-to-back based on OBJECTIDs
+    filtered_sample <- selected %>%
+      filter(!OBJECTID %in% (lag(selected$OBJECTID) + 1) & 
+             !OBJECTID %in% (lead(selected$OBJECTID) - 1))
+    
+    # If we still have 80, exit loop
+    if (nrow(filtered_sample) == sample_size) {
+      return(filtered_sample)
+    }
+    
+    # Get number of transects needed to reach 80
+    needed <- sample_size - nrow(filtered_sample)
+    
+    # Resample to fill gaps while avoiding back-to-back
+    additional_sample <- data %>%
+      filter(!OBJECTID %in% c(filtered_sample$OBJECTID, 
+                              filtered_sample$OBJECTID + 1, 
+                              filtered_sample$OBJECTID - 1)) %>%
+      slice_sample(n = min(needed, nrow(.)), replace = FALSE)
+    
+    # Update selected sample
+    selected <- bind_rows(filtered_sample, additional_sample) %>%
+      arrange(OBJECTID) %>%
+      distinct()
+    
+    # If additional_sample didn't add enough, restart the process
+    if (nrow(selected) < sample_size) {
+      selected <- data %>%
+        slice_sample(n = sample_size, replace = FALSE) %>%
+        arrange(OBJECTID)
+    }
+  }
+}
+
+initial_sample <- select_non_adjacent(data, sample_size)
+
+
+```
+
+### Second Strata (Watershed) Selection
+
+```{r}
+segment_counts <- c(A = 25, B = 25, C = 10, D = 20)
+max_sample_size <- 95  # Creating an upper limit so the function does do endless loops. 
+
+# Check current counts in the initial sample
+current_counts <- table(factor(initial_sample$Segment, levels = names(segment_counts)))
+print("Current counts per stratum in initial sample:")
+print(current_counts)
+
+# Identify which strata need additional transects
+needed_counts <- pmax(segment_counts - current_counts, 0)
+print("Transects still needed per stratum:")
+print(needed_counts)
+
+fill_missing_watershed_strata <- function(selected, data, needed_counts, max_size = max_sample_size) {
+  for (Segment in names(needed_counts)) {
+    needed <- needed_counts[Segment]
+    
+    if (needed > 0 && nrow(selected) < max_size) {
+      max_possible <- min(needed, max_size - nrow(selected))  
+      
+      additional_sample <- data %>%
+        filter(Segment == Segment, 
+               !OBJECTID %in% c(selected$OBJECTID, selected$OBJECTID + 1, selected$OBJECTID - 1)) %>%
+        slice_sample(n = min(max_possible, nrow(.)), replace = FALSE)
+      
+      if (nrow(additional_sample) > 0) {
+        selected <- bind_rows(selected, additional_sample) %>%
+          arrange(OBJECTID) %>%
+          distinct()
+      }
+    }
+  }
+  
+  return(selected)
+}
+
+# Apply function to add only necessary transects without removing any from initial_sample
+second_stratum_sample <- fill_missing_watershed_strata(initial_sample, data, needed_counts)
+
+```
+
+### Third Strata (Expert Opinion)
+
+```{r}
+# Define target number of transects for Expert Opinion (10% of total transects)
+target_yes_count <- ceiling(0.1 * total_transects)
+
+# Check current count of "Yes" in Expert Opinion
+current_yes_count <- sum(second_stratum_sample$Expert_Opinion == "Yes", na.rm = TRUE)  
+print(paste("Current count of Expert Opinion (Yes):", current_yes_count))
+
+# Determine how many more are needed, if any at all.
+needed_yes_count <- max(0, current_yes_count - target_yes_count)
+print(paste("Additional Expert Opinion (Yes) transects needed:", needed_yes_count))
+
+fill_expert_opinion_stratum <- function(selected, data, needed_yes_count, max_size = max_sample_size) {
+  if (needed_yes_count > 0 && nrow(selected) < max_size) {
+    max_possible <- min(needed_yes_count, max_size - nrow(selected))  # Ensure we do not exceed max limit
+
+    # Select only if 'Yes' quota is not met
+    additional_sample <- data %>%
+      filter(Expert_Opinion == "Yes", 
+             !OBJECTID %in% c(selected$OBJECTID, selected$OBJECTID + 1, selected$OBJECTID - 1)) %>%
+      slice_sample(n = min(max_possible, nrow(.)), replace = FALSE)
+
+    if (nrow(additional_sample) > 0) {
+      selected <- bind_rows(selected, additional_sample) %>%
+        arrange(OBJECTID) %>%
+        distinct()
+    }
+  }
+  
+  return(selected)
+}
+
+final_sample <- second_stratum_sample
+
+# **Only apply function if Expert Opinion quota is not already met**
+if (needed_yes_count > 0) {
+  final_sample <- fill_expert_opinion_stratum(second_stratum_sample, data, needed_yes_count)
+} else {
+  final_sample <- second_stratum_sample  # Keep as is if quota is met
+}
+
+print(paste("Final count of Expert Opinion (Yes):", sum(final_sample$Expert_Opinion == "Yes", na.rm = TRUE)))
+
+```
